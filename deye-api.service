@@ -1,0 +1,18 @@
+[Unit]
+Description=Deye Inverter Telemetry & MongoDB Ingestion API Service
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/deye-api
+ExecStart=/usr/bin/node /home/pi/deye-api/dist/server.js
+Restart=always
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=deye-api
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,41 @@
+{
+  "name": "deye-inv-api",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Barebone Deye Inverter Telemetry & 15-Minute Sync API Service for Raspberry Pi & Linux servers with MongoDB Atlas integration",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "start:ts": "tsx src/server.ts",
+    "dev": "tsx watch src/server.ts",
+    "test:day": "tsx src/testing/test-days-data.ts",
+    "sync": "tsx src/run-sync.ts"
+  },
+  "keywords": [
+    "deye",
+    "solar",
+    "inverter",
+    "openapi",
+    "telemetry",
+    "mongodb",
+    "raspberry-pi",
+    "iot"
+  ],
+  "author": "studioarc555",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mongodb": "^7.7.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
