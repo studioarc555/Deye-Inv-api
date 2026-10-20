@@ -4,6 +4,7 @@ import { getResidentialCollection } from "../db/mongoClient.js";
 export interface SyncOptions {
   date?: string; // YYYY-MM-DD
   includeRaw?: boolean;
+  plantId?: string;
 }
 
 export interface TelemetryUnits {
@@ -28,6 +29,16 @@ export interface TelemetryPoint {
   unitProduction?: string; // "kWh"
   unitGridPower?: string; // "kW"
   unitConsumptionPower?: string; // "kW"
+  deviceMetrics?: DeviceMetricPoint;
+}
+
+export interface DeviceMetric {
+  value: number;
+  unit: string;
+}
+
+export interface DeviceMetricPoint {
+  [key: string]: DeviceMetric;
 }
 
 /**
@@ -36,6 +47,8 @@ export interface TelemetryPoint {
  */
 export interface StationPacket {
   stationId: number;
+  plantId?: string;
+  isResidential?: boolean;
   stationName: string;
   deviceSn: string;
   date: string; // YYYY-MM-DD
@@ -73,6 +86,7 @@ export interface StationPacket {
 
     status: "normal" | "standby" | "fault" | "offline";
     lastUpdateTime: string;
+    deviceMetrics?: Record<string, DeviceMetric>;
   };
 
   // Structured point objects for charting
@@ -95,6 +109,26 @@ export interface StationPacket {
 
   alerts?: any[];
   rawDeyeLatest?: any;
+  rawDeyeMeasurePoints?: string[];
+}
+
+export interface ResidentialDashboardData {
+  packet: StationPacket;
+  availableStations: Array<{
+    stationId: number;
+    stationName: string;
+    deviceSn: string;
+    installedCapacityKw: number;
+    status: StationPacket["latestTelemetry"]["status"];
+  }>;
+  summary: {
+    monthlyProductionMwh: number;
+    lifetimeProductionMwh: number;
+    dailyGridFeedInKwh: number;
+    cumulativeGridFeedInMwh: number;
+    dailyConsumptionKwh: number;
+    cumulativeConsumptionMwh: number;
+  };
 }
 
 export class ResidentialMongoService {
@@ -131,7 +165,7 @@ export class ResidentialMongoService {
 
     const date = options.date || new Date().toISOString().slice(0, 10);
 
-    // 1. Fetch Station Details, Devices, and Latest Telemetry in parallel
+    // 1. Fetch station-level data needed to identify the inverter and build the packet.
     const [detailRes, devicesRes, latestRes, historyRes, alertRes] = await Promise.all([
       this.deyeClient.getStationDetail(stationId).catch(() => null),
       this.deyeClient.getStationDevices([stationId], 1, 50).catch(() => null),
@@ -156,6 +190,7 @@ export class ResidentialMongoService {
     ]);
 
     const station = detailRes?.data?.station;
+    const plantId = options.plantId ?? (station as any)?.plantId ?? (station as any)?.plantID;
     const deviceItems = devicesRes?.data?.deviceListItems || [];
     const latest = latestRes?.data;
     const rawHistoryItems = historyRes?.data?.stationDataItems || [];
@@ -164,8 +199,90 @@ export class ResidentialMongoService {
     // Identify primary inverter serial number
     const inverterDevice =
       deviceItems.find((d: any) => d.deviceType === "INVERTER") ||
-      deviceItems[0] || { deviceSn: process.env.DEFAULT_DEVICE_SN || "2506051213", deviceType: "INVERTER" };
+      deviceItems[0];
+    if (!inverterDevice?.deviceSn) {
+      throw new Error(`No inverter device found for Deye station ${stationId}.`);
+    }
     const deviceSn = inverterDevice.deviceSn;
+    const deviceLatestRes = await this.deyeClient.getDeviceLatest([deviceSn], "INVERTER").catch(() => null);
+    const deviceLatest = deviceLatestRes?.data?.deviceDataList?.[0];
+    const measurePointsRes = await this.deyeClient.getDeviceMeasurePoints(deviceSn, "INVERTER").catch(() => null);
+    const availableMeasurePoints = measurePointsRes?.data?.measurePoints || [];
+    const deviceMetrics = Object.fromEntries(
+      (deviceLatest?.dataList || [])
+        .map((item: any) => [item.key, { value: Number(item.value), unit: item.unit || "" }])
+        .filter((entry: any[]) => Number.isFinite(entry[1]?.value))
+    ) as Record<string, DeviceMetric>;
+    const historyMetricKeys = [
+      ...Array.from({ length: 8 }, (_, index) => `DCVoltagePV${index + 1}`),
+      ...Array.from({ length: 8 }, (_, index) => `DCCurrentPV${index + 1}`),
+      ...Array.from({ length: 8 }, (_, index) => `DCPowerPV${index + 1}`),
+      "TotalActiveACOutputPower",
+      "TotalConsumption",
+      "TotalConsumptionPower",
+      "TotalEnergyPurchased",
+      "TotalGridFeedIn",
+      "ACVoltageRUA",
+      "ACVoltageSVB",
+      "ACVoltageTWC",
+      "ACCurrentRUA",
+      "ACCurrentSVB",
+      "ACCurrentTWC",
+      "ACOutputFrequencyR",
+      "InverterOutputPowerL1",
+      "InverterOutputPowerL2",
+      "InverterOutputPowerL3",
+      ...Array.from({ length: 18 }, (_, index) => `CurrentBranch${index + 1}`),
+      ...Array.from({ length: 14 }, (_, index) => `BranchCurrent${index + 19}`),
+    ];
+    const historyMetricBatches = Array.from(
+      { length: Math.ceil(historyMetricKeys.length / 5) },
+      (_, index) => historyMetricKeys.slice(index * 5, index * 5 + 5)
+    );
+    const deviceHistoryResponses = await Promise.all(
+      historyMetricBatches.map((measurePoints) =>
+        this.deyeClient
+          .getDeviceHistory({
+            deviceSn,
+            deviceType: "INVERTER",
+            granularity: 1,
+            startAt: date,
+            endAt: date,
+            measurePoints,
+          })
+          .catch(() => null)
+      )
+    );
+    const deviceHistoryByTime = new Map<string, DeviceMetricPoint>();
+    deviceHistoryResponses.forEach((response) => {
+      (response?.data?.dataList || []).forEach((item: any) => {
+        const time = String(item.time || item.collectionTime || "");
+        if (!time) return;
+        const metrics = deviceHistoryByTime.get(time) || {};
+        (item.itemList || []).forEach((metric: any) => {
+          const value = Number(metric.value);
+          if (Number.isFinite(value) && metric.key) {
+            metrics[metric.key] = { value, unit: metric.unit || "" };
+          }
+        });
+        deviceHistoryByTime.set(time, metrics);
+      });
+    });
+    const deviceHistoryTimes = Array.from(deviceHistoryByTime.keys())
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const getDeviceMetricsForTimestamp = (timestamp: unknown) => {
+      const target = Number(timestamp);
+      if (!Number.isFinite(target) || deviceHistoryTimes.length === 0) return undefined;
+      let closest = deviceHistoryTimes[0];
+      for (const candidate of deviceHistoryTimes) {
+        if (Math.abs(candidate - target) < Math.abs(closest - target)) closest = candidate;
+      }
+      return Math.abs(closest - target) <= 600
+        ? deviceHistoryByTime.get(String(closest))
+        : undefined;
+    };
 
     // 2. Format 5-Minute Time-Series Points with explicit KPI Units
     const dtmArray: string[] = [];
@@ -212,6 +329,7 @@ export class ResidentialMongoService {
           unitProduction: "kWh",
           unitGridPower: "kW",
           unitConsumptionPower: "kW",
+          deviceMetrics: getDeviceMetricsForTimestamp(item.timeStamp),
         });
       });
     } else {
@@ -240,9 +358,23 @@ export class ResidentialMongoService {
 
     // 3. Assemble Latest Telemetry Snapshot with explicit units
     const realTimePowerKw = parseFloat(((latest?.generationPower || 0) / 1000).toFixed(2));
-    const installedCapacityKw = station?.installedCapacity ?? (stationId === 5652 ? 5 : 58);
-    const dailyProductionKwh = runningProductionKwh > 0 ? parseFloat(runningProductionKwh.toFixed(1)) : 120.1;
-    const totalProductionMwh = 43.66;
+    const ratedPowerKw = deviceMetrics.RatedPower?.value;
+    const installedCapacityKw =
+      typeof station?.installedCapacity === "number"
+        ? station.installedCapacity
+        : typeof ratedPowerKw === "number"
+        ? ratedPowerKw / 1000
+        : 0;
+    const dailyMetric = deviceMetrics.DailyActiveProduction?.value;
+    const totalMetric = deviceMetrics.TotalActiveProduction?.value;
+    const dailyProductionKwh =
+      dailyMetric !== undefined
+        ? parseFloat(dailyMetric.toFixed(1))
+        : parseFloat(runningProductionKwh.toFixed(1));
+    const totalProductionMwh =
+      totalMetric !== undefined
+        ? parseFloat((totalMetric / 1000).toFixed(3))
+        : 0;
 
     let status: "normal" | "standby" | "fault" | "offline" = "normal";
     if (station?.connectionStatus === "ALL_OFFLINE") {
@@ -262,6 +394,7 @@ export class ResidentialMongoService {
     // 4. Build Document without packetName, with full KPI units
     const packet: StationPacket = {
       stationId,
+      ...(plantId ? { plantId: String(plantId), isResidential: true } : {}),
       stationName: station?.name || `Station ${stationId}`,
       deviceSn,
       date,
@@ -299,6 +432,7 @@ export class ResidentialMongoService {
 
         status,
         lastUpdateTime: lastUpdateFormatted,
+        deviceMetrics,
       },
       dtm: dtmArray,
       production: productionArray,
@@ -306,6 +440,8 @@ export class ResidentialMongoService {
       gridPower: gridPowerArray,
       consumptionPower: consumptionPowerArray,
       points,
+      rawDeyeLatest: { stationLatest: latest, deviceLatest },
+      rawDeyeMeasurePoints: availableMeasurePoints,
       metadata: {
         locationAddress: station?.locationAddress,
         latitude: station?.locationLat,
@@ -327,9 +463,7 @@ export class ResidentialMongoService {
       })),
     };
 
-    if (options.includeRaw) {
-      packet.rawDeyeLatest = latest;
-    }
+    if (options.includeRaw) packet.rawDeyeLatest = { stationLatest: latest, deviceLatest };
 
     // 5. ATOMIC UPSERT INTO MONGODB
     // Database: myDatabase, Collection: ResidentialAPI
@@ -405,7 +539,11 @@ export class ResidentialMongoService {
       const st = stations[i];
       const packetIndex = i + 1;
       try {
-        const res = await this.pullAndSaveStationPacket(st.id, packetIndex, { date, includeRaw: options.includeRaw });
+        const res = await this.pullAndSaveStationPacket(st.id, packetIndex, {
+          date,
+          includeRaw: options.includeRaw,
+          plantId: (st as any).plantId ?? (st as any).plantID,
+        });
         packetsSummary.push({
           stationId: res.stationId,
           stationName: res.stationName,
@@ -469,6 +607,192 @@ export class ResidentialMongoService {
       .toArray()) as unknown as StationPacket[];
   }
 
+  public async getResidentialPlants(): Promise<Array<{
+    plantId: string;
+    stationId: number;
+    stationName: string;
+    deviceSn: string;
+    installedCapacityKw: number;
+    status: StationPacket["latestTelemetry"]["status"];
+  }>> {
+    const collection = await getResidentialCollection();
+    const packets = await collection.find(
+      {},
+      {
+        projection: {
+          _id: 0,
+          plantId: 1,
+          stationId: 1,
+          stationName: 1,
+          deviceSn: 1,
+          "latestTelemetry.installedCapacityKw": 1,
+          "latestTelemetry.status": 1,
+          updatedAt: 1,
+        },
+      }
+    ).sort({ updatedAt: -1 }).toArray() as unknown as Array<StationPacket & { updatedAt?: Date }>;
+
+    return Array.from(new Map(
+      packets.map((packet) => [
+        packet.plantId || `deye:${packet.stationId}`,
+        {
+          // Older packets do not have a CMS plant mapping yet. Use a stable
+          // Deye namespace until the explicit plantId mapping is available.
+          plantId: packet.plantId || `deye:${packet.stationId}`,
+          stationId: packet.stationId,
+          stationName: packet.stationName,
+          deviceSn: packet.deviceSn,
+          installedCapacityKw: packet.latestTelemetry.installedCapacityKw,
+          status: packet.latestTelemetry.status,
+        },
+      ])
+    ).values());
+  }
+
+  /**
+   * Reads the dashboard snapshot and aggregates persisted daily packets.
+   * This intentionally never calls Deye Cloud; ingestion is handled by the
+   * scheduled sync process.
+   */
+  public async getDashboardData(
+    stationIdParam?: string | number,
+    date?: string,
+    stationName?: string
+  ): Promise<ResidentialDashboardData | null> {
+    const collection = await getResidentialCollection();
+    const parsedStationId = stationIdParam ? parseInt(String(stationIdParam), 10) : undefined;
+    const stationId =
+      parsedStationId && !Number.isNaN(parsedStationId) ? parsedStationId : undefined;
+
+    let packet = (await collection.findOne(
+      {
+        ...(stationId ? { stationId } : {}),
+        ...(stationName
+          ? {
+              stationName: {
+                $regex: `^${stationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+                $options: "i",
+              },
+            }
+          : {}),
+        ...(date ? { date } : {}),
+      },
+      {
+        sort: { updatedAt: -1 },
+        projection: { _id: 0 },
+      }
+    )) as StationPacket | null;
+
+    if (!packet && stationName) {
+      packet = (await collection.findOne(
+        {
+          stationName: { $regex: `^${stationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+          ...(date ? { date } : {}),
+        },
+        { sort: { updatedAt: -1 }, projection: { _id: 0 } }
+      )) as StationPacket | null;
+    }
+
+    // Compatibility mode: until CMS plants are mapped to Deye stations, use
+    // the newest persisted packet for the requested date when the selector
+    // has no match. Never substitute a different date.
+    if (!packet) {
+      packet = (await collection.findOne(
+        date ? { date } : {},
+        { sort: { updatedAt: -1 }, projection: { _id: 0 } }
+      )) as StationPacket | null;
+    }
+
+    if (!packet) {
+      return null;
+    }
+
+    const packetDatePrefix = (date || packet.date).slice(0, 7);
+    const periodPackets = (await collection
+      .find(
+        {
+          stationId: packet.stationId,
+          date: { $regex: `^${packetDatePrefix}` },
+        },
+        {
+          projection: {
+            _id: 0,
+            date: 1,
+            production: 1,
+            latestTelemetry: 1,
+          },
+        }
+      )
+      .toArray()) as unknown as Pick<StationPacket, "date" | "production" | "latestTelemetry">[];
+
+    const allPackets = (await collection
+      .find(
+        { stationId: packet.stationId },
+        { projection: { _id: 0, latestTelemetry: 1 } }
+      )
+      .sort({ updatedAt: -1 })
+      .limit(1)
+      .toArray()) as unknown as Pick<StationPacket, "latestTelemetry">[];
+
+    const stationPackets = (await collection
+      .find(
+        {},
+        {
+          projection: {
+            _id: 0,
+            stationId: 1,
+            stationName: 1,
+            deviceSn: 1,
+            updatedAt: 1,
+            "latestTelemetry.installedCapacityKw": 1,
+            "latestTelemetry.status": 1,
+          },
+        }
+      )
+      .sort({ updatedAt: -1 })
+      .toArray()) as unknown as Array<Pick<StationPacket, "stationId" | "stationName" | "deviceSn" | "latestTelemetry">>;
+    const availableStations = Array.from(
+      new Map(
+        stationPackets.map((item) => [
+          item.stationId,
+          {
+            stationId: item.stationId,
+            stationName: item.stationName,
+            deviceSn: item.deviceSn,
+            installedCapacityKw: item.latestTelemetry.installedCapacityKw,
+            status: item.latestTelemetry.status,
+          },
+        ])
+      ).values()
+    );
+
+    const dailyGridFeedInKwh = periodPackets.reduce(
+      (sum, item) => sum + (item.latestTelemetry?.dailyProduction || 0),
+      0
+    );
+    const latestLifetime = allPackets[0]?.latestTelemetry?.totalProductionMwh || packet.latestTelemetry.totalProductionMwh;
+    const latestDeviceMetrics = packet.latestTelemetry.deviceMetrics || {};
+    const dailyConsumptionKwh =
+      latestDeviceMetrics.TotalConsumption?.value ?? packet.points.at(-1)?.consumptionPower ?? 0;
+    const cumulativeConsumptionMwh =
+      typeof latestDeviceMetrics.TotalConsumption?.value === "number"
+        ? latestDeviceMetrics.TotalConsumption.value / 1000
+        : 0;
+
+    return {
+      packet,
+      availableStations,
+      summary: {
+        monthlyProductionMwh: Number((dailyGridFeedInKwh / 1000).toFixed(3)),
+        lifetimeProductionMwh: latestLifetime,
+        dailyGridFeedInKwh: packet.latestTelemetry.dailyProductionKwh,
+        cumulativeGridFeedInMwh: packet.latestTelemetry.totalProductionMwh,
+        dailyConsumptionKwh,
+        cumulativeConsumptionMwh,
+      },
+    };
+  }
+
   /**
    * Purges legacy "packetName" field across all documents in MongoDB
    */
@@ -485,4 +809,3 @@ export class ResidentialMongoService {
     }
   }
 }
-

@@ -41,6 +41,7 @@ app.get("/", (req, res) => {
       sync15MinPackets: "POST /api/residential/sync-packets",
       syncSingleStation: "POST /api/residential/sync-packets/:stationId",
       dashboardOverview: "GET /api/residential/dashboard/overview?plantId=:id&date=YYYY-MM-DD",
+      dashboardData: "GET /api/residential/dashboard/data?plantId=:id&date=YYYY-MM-DD",
     },
   });
 });
@@ -241,12 +242,56 @@ app.get("/api/residential/dashboard/overview", async (req, res) => {
       success: false,
       error: err.message || "Failed to fetch dashboard overview",
     });
+
   }
 });
 
 // =========================================================================
 // MongoDB Integration Routes (Database: myDatabase, Collection: ResidentialAPI)
 // =========================================================================
+
+app.get("/api/residential/dashboard/data", async (req, res) => {
+  try {
+    const plantId = req.query.plantId as string | undefined;
+    const date = req.query.date as string | undefined;
+    const plantName = req.query.plantName as string | undefined;
+    const dashboardData = await mongoService.getDashboardData(plantId, date, plantName);
+
+    if (!dashboardData) {
+      return res.status(404).json({
+        success: false,
+        error: "No persisted residential dashboard packet was found.",
+      });
+
+    }
+
+    return res.json({
+      success: true,
+      source: "mongodb",
+      requestedPlantId: plantId || null,
+      resolvedStationId: dashboardData.packet.stationId,
+      ...dashboardData,
+    });
+
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err.message || "Failed to fetch persisted dashboard data",
+    });
+  }
+});
+
+app.get("/api/residential/plants", async (_req, res) => {
+  try {
+    res.json({
+      success: true,
+      source: "mongodb",
+      plants: await mongoService.getResidentialPlants(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || "Failed to fetch residential plants" });
+  }
+});
 
 /**
  * Check MongoDB Connection Status & Collection Stats
@@ -304,10 +349,11 @@ app.post(["/api/residential/sync-packets/:stationId?", "/api/residential/sync-15
     const targetStationId = (req.params as any).stationId || (req.query.stationId as string);
     const date = (req.query.date as string) || req.body.date || new Date().toISOString().slice(0, 10);
     const includeRaw = req.query.includeRaw === "true" || req.body.includeRaw === true;
+    const plantId = (req.query.plantId as string) || req.body.plantId;
 
     if (targetStationId) {
       // Sync single dynamic station
-      const singleRes = await mongoService.pullAndSaveStationPacket(String(targetStationId), 1, { date, includeRaw });
+      const singleRes = await mongoService.pullAndSaveStationPacket(String(targetStationId), 1, { date, includeRaw, plantId });
       return res.json({
         message: `Successfully executed 5-minute telemetry sync and atomic upsert for station ${targetStationId}`,
         database: "myDatabase",
