@@ -50,8 +50,6 @@ app.get("/", (req, res) => {
       syncSingleStation: "POST /api/sync/:stationId",
       savedPackets: "GET /api/packets?date=YYYY-MM-DD",
       singleStationPacket: "GET /api/packets/:stationId?date=YYYY-MM-DD",
-      plants: "GET /api/plants",
-      dashboardData: "GET /api/dashboard/data?plantId=:id&date=YYYY-MM-DD",
     },
   });
 });
@@ -184,54 +182,6 @@ app.get(["/api/db-status", "/api/residential/db-status"], async (req, res) => {
   }
 });
 
-/**
- * Get distinct registered plants/stations from MongoDB (for CMS integrations)
- */
-app.get(["/api/plants", "/api/residential/plants"], async (_req, res) => {
-  try {
-    const plants = await mongoService.getResidentialPlants();
-    res.json({
-      success: true,
-      source: "mongodb",
-      totalPlants: plants.length,
-      plants,
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message || "Failed to fetch residential plants" });
-  }
-});
-
-/**
- * Aggregated dashboard snapshot directly from persisted MongoDB packets (zero Deye Cloud latency)
- */
-app.get(["/api/dashboard/data", "/api/residential/dashboard/data"], async (req, res) => {
-  try {
-    const plantId = (req.query.plantId as string) || (req.query.stationId as string);
-    const date = req.query.date as string | undefined;
-    const plantName = (req.query.plantName as string) || (req.query.stationName as string);
-    const dashboardData = await mongoService.getDashboardData(plantId, date, plantName);
-
-    if (!dashboardData) {
-      return res.status(404).json({
-        success: false,
-        error: "No persisted residential dashboard packet was found.",
-      });
-    }
-
-    return res.json({
-      success: true,
-      source: "mongodb",
-      requestedPlantId: plantId || null,
-      resolvedStationId: dashboardData.packet.stationId,
-      ...dashboardData,
-    });
-  } catch (err: any) {
-    return res.status(500).json({
-      success: false,
-      error: err.message || "Failed to fetch persisted dashboard data",
-    });
-  }
-});
 
 /**
  * Ingest telemetry from Deye Cloud and atomically save/upsert to MongoDB:
