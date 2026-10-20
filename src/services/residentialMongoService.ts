@@ -87,6 +87,7 @@ export interface StationPacket {
     status: "normal" | "standby" | "fault" | "offline";
     lastUpdateTime: string;
     deviceMetrics?: Record<string, DeviceMetric>;
+    deviceMetricsBySn?: Record<string, Record<string, DeviceMetric>>;
   };
 
   // Structured point objects for charting
@@ -105,7 +106,9 @@ export interface StationPacket {
     deviceSn: string;
     deviceType: string;
     connectStatus?: number;
+    deviceMetrics?: Record<string, DeviceMetric>;
   }>;
+  deviceMetricsBySn?: Record<string, Record<string, DeviceMetric>>;
 
   alerts?: any[];
   rawDeyeLatest?: any;
@@ -204,8 +207,17 @@ export class ResidentialMongoService {
       throw new Error(`No inverter device found for Deye station ${stationId}.`);
     }
     const deviceSn = inverterDevice.deviceSn;
-    const deviceLatestRes = await this.deyeClient.getDeviceLatest([deviceSn], "INVERTER").catch(() => null);
-    const deviceLatest = deviceLatestRes?.data?.deviceDataList?.[0];
+    const inverterDevices = deviceItems.filter((device: any) => device.deviceType === "INVERTER" && device.deviceSn);
+    const inverterSerialNumbers = inverterDevices.length
+      ? inverterDevices.map((device: any) => device.deviceSn)
+      : [deviceSn];
+    const deviceLatestRes = await this.deyeClient
+      .getDeviceLatest(inverterSerialNumbers, "INVERTER")
+      .catch(() => null);
+    const latestDevices = deviceLatestRes?.data?.deviceDataList || [];
+    const deviceLatest =
+      latestDevices.find((device: any) => device.deviceSn === deviceSn) ||
+      latestDevices[0];
     const measurePointsRes = await this.deyeClient.getDeviceMeasurePoints(deviceSn, "INVERTER").catch(() => null);
     const availableMeasurePoints = measurePointsRes?.data?.measurePoints || [];
     const deviceMetrics = Object.fromEntries(
@@ -213,6 +225,16 @@ export class ResidentialMongoService {
         .map((item: any) => [item.key, { value: Number(item.value), unit: item.unit || "" }])
         .filter((entry: any[]) => Number.isFinite(entry[1]?.value))
     ) as Record<string, DeviceMetric>;
+    const deviceMetricsBySn = Object.fromEntries(
+      latestDevices.map((device: any) => [
+        device.deviceSn,
+        Object.fromEntries(
+          (device.dataList || [])
+            .map((item: any) => [item.key, { value: Number(item.value), unit: item.unit || "" }])
+            .filter((entry: any[]) => Number.isFinite(entry[1]?.value))
+        ),
+      ])
+    ) as Record<string, Record<string, DeviceMetric>>;
     const historyMetricKeys = [
       ...Array.from({ length: 8 }, (_, index) => `DCVoltagePV${index + 1}`),
       ...Array.from({ length: 8 }, (_, index) => `DCCurrentPV${index + 1}`),
@@ -433,6 +455,7 @@ export class ResidentialMongoService {
         status,
         lastUpdateTime: lastUpdateFormatted,
         deviceMetrics,
+        deviceMetricsBySn,
       },
       dtm: dtmArray,
       production: productionArray,
@@ -454,7 +477,9 @@ export class ResidentialMongoService {
         deviceSn: d.deviceSn,
         deviceType: d.deviceType,
         connectStatus: d.connectStatus,
+        ...(deviceMetricsBySn[d.deviceSn] ? { deviceMetrics: deviceMetricsBySn[d.deviceSn] } : {}),
       })),
+      deviceMetricsBySn,
       alerts: alertItems.map((a: any) => ({
         alertId: a.alertId,
         alertName: a.alertName,
@@ -617,7 +642,10 @@ export class ResidentialMongoService {
   }>> {
     const collection = await getResidentialCollection();
     const packets = await collection.find(
-      {},
+    {
+      plantId: { $exists: true, $type: "string", $ne: "" },
+      stationId: { $exists: true, $type: "number" },
+    },
       {
         projection: {
           _id: 0,
@@ -634,11 +662,9 @@ export class ResidentialMongoService {
 
     return Array.from(new Map(
       packets.map((packet) => [
-        packet.plantId || `deye:${packet.stationId}`,
+        packet.plantId as string,
         {
-          // Older packets do not have a CMS plant mapping yet. Use a stable
-          // Deye namespace until the explicit plantId mapping is available.
-          plantId: packet.plantId || `deye:${packet.stationId}`,
+          plantId: packet.plantId as string,
           stationId: packet.stationId,
           stationName: packet.stationName,
           deviceSn: packet.deviceSn,
