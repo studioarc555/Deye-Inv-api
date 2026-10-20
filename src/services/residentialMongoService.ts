@@ -46,8 +46,8 @@ export interface DeviceMetricPoint {
  * Station ID, Device SN, units, DTM-[...], Production-[...], active Power-[...], grid Power-[...], consumption Power-[...], etc.
  */
 export interface StationPacket {
-  stationId: number;
   plantId?: string;
+  stationId: number;
   isResidential?: boolean;
   stationName: string;
   deviceSn: string;
@@ -107,17 +107,53 @@ export interface StationPacket {
     deviceType: string;
     connectStatus?: number;
     deviceMetrics?: Record<string, DeviceMetric>;
+    deviceState?: number;
+    collectionTime?: number;
+    dataPointsCount?: number;
   }>;
   deviceMetricsBySn?: Record<string, Record<string, DeviceMetric>>;
+
+  // Complete Inverter Electrical & String Datasets
+  electrical?: {
+    dcStrings: Array<{
+      pv: number;
+      voltage: number;
+      voltageUnit: string;
+      current: number;
+      currentUnit: string;
+      powerWatts: number;
+    }>;
+    acGrid: {
+      voltageR: number;
+      voltageS: number;
+      voltageT: number;
+      currentR: number;
+      currentS: number;
+      currentT: number;
+      frequencyHz: number;
+      totalActivePowerWatts: number;
+      lineVoltageAB: number;
+      lineVoltageBC: number;
+      lineVoltageCA: number;
+    };
+    temperatures: {
+      inverterTemp?: number;
+      radiatorTemp?: number;
+    };
+    parametersCount: number;
+    parameters: Record<string, { value: any; unit?: string; name?: string }>;
+  };
 
   alerts?: any[];
   rawDeyeLatest?: any;
   rawDeyeMeasurePoints?: string[];
 }
 
+
 export interface ResidentialDashboardData {
   packet: StationPacket;
   availableStations: Array<{
+    plantId?: string;
     stationId: number;
     stationName: string;
     deviceSn: string;
@@ -193,7 +229,7 @@ export class ResidentialMongoService {
     ]);
 
     const station = detailRes?.data?.station;
-    const plantId = options.plantId ?? (station as any)?.plantId ?? (station as any)?.plantID;
+    const plantId = options.plantId || (station as any)?.plantId || (station as any)?.plantID || `deye:${stationId}`;
     const deviceItems = devicesRes?.data?.deviceListItems || [];
     const latest = latestRes?.data;
     const rawHistoryItems = historyRes?.data?.stationDataItems || [];
@@ -306,6 +342,93 @@ export class ResidentialMongoService {
         : undefined;
     };
 
+    // Fetch device-level electrical datasets (DC strings, AC phases, voltages, currents)
+    const deviceSns = deviceItems.map((d: any) => d.deviceSn).filter(Boolean);
+    let deviceLatestList: any[] = [];
+    if (deviceSns.length > 0) {
+      try {
+        const devRes = await this.deyeClient.getDeviceLatest(deviceSns.slice(0, 10), "INVERTER");
+        if (devRes.success && devRes.data?.deviceDataList) {
+          deviceLatestList = devRes.data.deviceDataList;
+        }
+      } catch {
+        // Fallback gracefully if device latest endpoint is unavailable
+      }
+    }
+
+    const deviceLatestMap = new Map<string, any>();
+    deviceLatestList.forEach((dl: any) => {
+      if (dl.deviceSn) deviceLatestMap.set(dl.deviceSn, dl);
+    });
+
+    // Primary inverter device electrical parsing
+    const primaryDeviceData = deviceLatestMap.get(deviceSn) || deviceLatestList[0];
+    const dataList: Array<{ key: string; value: any; unit?: string; name?: string }> =
+      primaryDeviceData?.dataList || [];
+
+    // Extract DC String datasets (PV1 to PV8)
+    const dcStrings: Array<{
+      pv: number;
+      voltage: number;
+      voltageUnit: string;
+      current: number;
+      currentUnit: string;
+      powerWatts: number;
+    }> = [];
+
+    for (let i = 1; i <= 8; i++) {
+      const vPoint = dataList.find((p) => p.key === `DCVoltagePV${i}`);
+      const cPoint = dataList.find((p) => p.key === `DCCurrentPV${i}`);
+      if (vPoint || cPoint) {
+        const v = parseFloat(String(vPoint?.value || 0)) || 0;
+        const c = parseFloat(String(cPoint?.value || 0)) || 0;
+        dcStrings.push({
+          pv: i,
+          voltage: v,
+          voltageUnit: vPoint?.unit || "V",
+          current: c,
+          currentUnit: cPoint?.unit || "A",
+          powerWatts: parseFloat((v * c).toFixed(2)),
+        });
+      }
+    }
+
+    const getVal = (key: string) => {
+      const p = dataList.find((item) => item.key === key);
+      return p ? parseFloat(String(p.value)) || 0 : 0;
+    };
+
+    const acGrid = {
+      voltageR: getVal("ACVoltageRUA"),
+      voltageS: getVal("ACVoltageSVB"),
+      voltageT: getVal("ACVoltageTWC"),
+      currentR: getVal("ACCurrentRUA"),
+      currentS: getVal("ACCurrentSVB"),
+      currentT: getVal("ACCurrentTWC"),
+      frequencyHz: getVal("ACOutputFrequencyR"),
+      totalActivePowerWatts: getVal("TotalActiveACOutputPower"),
+      lineVoltageAB: getVal("ABLineVoltage"),
+      lineVoltageBC: getVal("BCLineVoltage"),
+      lineVoltageCA: getVal("CALineVoltage"),
+    };
+
+    const temperatures = {
+      inverterTemp: getVal("InverterTemperature"),
+      radiatorTemp: getVal("RadiatorTemperature"),
+    };
+
+    const electricalParameters = dataList.reduce(
+      (acc: Record<string, { value: any; unit?: string; name?: string }>, p) => {
+        acc[p.key] = {
+          value: p.value,
+          unit: p.unit || "",
+          name: p.name || p.key,
+        };
+        return acc;
+      },
+      {}
+    );
+
     // 2. Format 5-Minute Time-Series Points with explicit KPI Units
     const dtmArray: string[] = [];
     const productionArray: number[] = [];
@@ -396,6 +519,8 @@ export class ResidentialMongoService {
     const totalProductionMwh =
       totalMetric !== undefined
         ? parseFloat((totalMetric / 1000).toFixed(3))
+        : (station as any)?.totalGeneration
+        ? parseFloat(((station as any).totalGeneration / 1000).toFixed(3))
         : 0;
 
     let status: "normal" | "standby" | "fault" | "offline" = "normal";
@@ -415,6 +540,7 @@ export class ResidentialMongoService {
 
     // 4. Build Document without packetName, with full KPI units
     const packet: StationPacket = {
+      plantId,
       stationId,
       ...(plantId ? { plantId: String(plantId), isResidential: true } : {}),
       stationName: station?.name || `Station ${stationId}`,
@@ -473,12 +599,25 @@ export class ResidentialMongoService {
         gridType: station?.gridInterconnectionType,
         connectionStatus: station?.connectionStatus || status,
       },
-      devices: deviceItems.map((d: any) => ({
-        deviceSn: d.deviceSn,
-        deviceType: d.deviceType,
-        connectStatus: d.connectStatus,
-        ...(deviceMetricsBySn[d.deviceSn] ? { deviceMetrics: deviceMetricsBySn[d.deviceSn] } : {}),
-      })),
+      electrical: {
+        dcStrings,
+        acGrid,
+        temperatures,
+        parametersCount: dataList.length,
+        parameters: electricalParameters,
+      },
+      devices: deviceItems.map((d: any) => {
+        const devData = deviceLatestMap.get(d.deviceSn);
+        return {
+          deviceSn: d.deviceSn,
+          deviceType: d.deviceType,
+          connectStatus: d.connectStatus,
+          deviceState: devData?.deviceState,
+          collectionTime: devData?.collectionTime,
+          dataPointsCount: devData?.dataList?.length || 0,
+          ...(deviceMetricsBySn[d.deviceSn] ? { deviceMetrics: deviceMetricsBySn[d.deviceSn] } : {}),
+        };
+      }),
       deviceMetricsBySn,
       alerts: alertItems.map((a: any) => ({
         alertId: a.alertId,
@@ -553,9 +692,19 @@ export class ResidentialMongoService {
     const overallStartTime = Date.now();
     const date = options.date || new Date().toISOString().slice(0, 10);
 
-    // Fetch station list
-    const listRes = await this.deyeClient.getStationList(1, 50);
-    const stations = listRes.data?.stationList || [];
+    // Fetch station list across all pages dynamically
+    let page = 1;
+    const stations: any[] = [];
+    while (true) {
+      const listRes = await this.deyeClient.getStationList(page, 50);
+      const pageStations = listRes.data?.stationList || [];
+      stations.push(...pageStations);
+      const totalExpected = listRes.data?.total || 0;
+      if (pageStations.length === 0 || stations.length >= totalExpected || pageStations.length < 50) {
+        break;
+      }
+      page++;
+    }
 
     const packetsSummary: any[] = [];
 
@@ -818,6 +967,8 @@ export class ResidentialMongoService {
       },
     };
   }
+
+
 
   /**
    * Purges legacy "packetName" field across all documents in MongoDB

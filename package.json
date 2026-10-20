@@ -9,7 +9,6 @@
     "start": "node dist/server.js",
     "start:ts": "tsx src/server.ts",
     "dev": "tsx watch src/server.ts",
-    "test:day": "tsx src/testing/test-days-data.ts",
     "sync": "tsx src/run-sync.ts"
   },
   "keywords": [
