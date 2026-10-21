@@ -139,6 +139,36 @@ app.post("/api/config", (req, res) => {
 // MongoDB Integration & Telemetry Sync Routes
 // =========================================================================
 
+app.get(["/api/dashboard/data", "/api/residential/dashboard/data"], async (req, res) => {
+  try {
+    const plantId = req.query.plantId as string | undefined;
+    const date = req.query.date as string | undefined;
+    const plantName = req.query.plantName as string | undefined;
+    const dashboardData = await mongoService.getDashboardData(plantId, date, plantName);
+
+    if (!dashboardData) {
+      return res.status(404).json({
+        success: false,
+        error: "No persisted residential dashboard packet was found.",
+      });
+
+    }
+
+    return res.json({
+      success: true,
+      source: "mongodb",
+      requestedPlantId: plantId || null,
+      resolvedStationId: dashboardData.packet.stationId,
+      ...dashboardData,
+    });
+
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err.message || "Failed to fetch persisted dashboard data",
+    });
+  }
+});
 /**
  * Check MongoDB Connection Status & Collection Stats
  */

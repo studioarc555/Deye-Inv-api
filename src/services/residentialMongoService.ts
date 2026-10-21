@@ -149,7 +149,24 @@ export interface StationPacket {
   rawDeyeMeasurePoints?: string[];
 }
 
-
+export interface ResidentialDashboardData {
+  packet: StationPacket;
+  availableStations: Array<{
+    stationId: number;
+    stationName: string;
+    deviceSn: string;
+    installedCapacityKw: number;
+    status: StationPacket["latestTelemetry"]["status"];
+  }>;
+  summary: {
+    monthlyProductionMwh: number;
+    lifetimeProductionMwh: number;
+    dailyGridFeedInKwh: number;
+    cumulativeGridFeedInMwh: number;
+    dailyConsumptionKwh: number;
+    cumulativeConsumptionMwh: number;
+  };
+}
 
 export class ResidentialMongoService {
   private deyeClient: DeyeClient;
@@ -762,7 +779,152 @@ export class ResidentialMongoService {
       .toArray()) as unknown as StationPacket[];
   }
 
+  /**
+   * Reads the dashboard snapshot and aggregates persisted daily packets.
+   * This intentionally never calls Deye Cloud; ingestion is handled by the
+   * scheduled sync process.
+   */
+  public async getDashboardData(
+    stationIdParam?: string | number,
+    date?: string,
+    stationName?: string
+  ): Promise<ResidentialDashboardData | null> {
+    const collection = await getResidentialCollection();
+    const isNumeric = stationIdParam !== undefined && /^\d+$/.test(String(stationIdParam).trim());
+    const stationId = isNumeric ? parseInt(String(stationIdParam).trim(), 10) : undefined;
+    const plantIdStr = !isNumeric && stationIdParam ? String(stationIdParam).trim() : undefined;
 
+    const queryFilters: any[] = [];
+    if (stationId) queryFilters.push({ stationId });
+    if (plantIdStr) queryFilters.push({ plantId: plantIdStr });
+    if (stationName) {
+      queryFilters.push({
+        stationName: {
+          $regex: `^${stationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+          $options: "i",
+        },
+      });
+    }
+
+    const baseFilter: any = {};
+    if (date) baseFilter.date = date;
+    if (queryFilters.length > 0) {
+      baseFilter.$or = queryFilters;
+    }
+
+    let packet = (await collection.findOne(
+      baseFilter,
+      {
+        sort: { updatedAt: -1 },
+        projection: { _id: 0 },
+      }
+    )) as StationPacket | null;
+
+    // If date-specific packet not found, try finding the latest available packet for this specific station/plant
+    if (!packet && queryFilters.length > 0) {
+      packet = (await collection.findOne(
+        { $or: queryFilters },
+        { sort: { updatedAt: -1 }, projection: { _id: 0 } }
+      )) as StationPacket | null;
+    }
+
+    // Fallback only if no specific station/plant filter was requested
+    if (!packet && queryFilters.length === 0) {
+      packet = (await collection.findOne(
+        date ? { date } : {},
+        { sort: { updatedAt: -1 }, projection: { _id: 0 } }
+      )) as StationPacket | null;
+    }
+
+    if (!packet) {
+      return null;
+    }
+
+    const packetDatePrefix = (date || packet.date).slice(0, 7);
+    const periodPackets = (await collection
+      .find(
+        {
+          stationId: packet.stationId,
+          date: { $regex: `^${packetDatePrefix}` },
+        },
+        {
+          projection: {
+            _id: 0,
+            date: 1,
+            production: 1,
+            latestTelemetry: 1,
+          },
+        }
+      )
+      .toArray()) as unknown as Pick<StationPacket, "date" | "production" | "latestTelemetry">[];
+
+    const allPackets = (await collection
+      .find(
+        { stationId: packet.stationId },
+        { projection: { _id: 0, latestTelemetry: 1 } }
+      )
+      .sort({ updatedAt: -1 })
+      .limit(1)
+      .toArray()) as unknown as Pick<StationPacket, "latestTelemetry">[];
+
+    const stationPackets = (await collection
+      .find(
+        {},
+        {
+          projection: {
+            _id: 0,
+            stationId: 1,
+            stationName: 1,
+            deviceSn: 1,
+            updatedAt: 1,
+            "latestTelemetry.installedCapacityKw": 1,
+            "latestTelemetry.status": 1,
+          },
+        }
+      )
+      .sort({ updatedAt: -1 })
+      .toArray()) as unknown as Array<Pick<StationPacket, "stationId" | "stationName" | "deviceSn" | "latestTelemetry">>;
+    const availableStations = Array.from(
+      new Map(
+        stationPackets.map((item) => [
+          item.stationId,
+          {
+            stationId: item.stationId,
+            stationName: item.stationName,
+            deviceSn: item.deviceSn,
+            installedCapacityKw: item.latestTelemetry.installedCapacityKw,
+            status: item.latestTelemetry.status,
+          },
+        ])
+      ).values()
+    );
+
+    const dailyGridFeedInKwh = periodPackets.reduce(
+      (sum, item) => sum + (item.latestTelemetry?.dailyProduction || 0),
+      0
+    );
+    const latestLifetime = allPackets[0]?.latestTelemetry?.totalProductionMwh || packet.latestTelemetry.totalProductionMwh;
+    const latestDeviceMetrics = packet.latestTelemetry.deviceMetrics || {};
+    const dailyConsumptionKwh =
+      latestDeviceMetrics.TotalConsumption?.value ?? packet.points.at(-1)?.consumptionPower ?? 0;
+    const cumulativeConsumptionMwh =
+      typeof latestDeviceMetrics.TotalConsumption?.value === "number"
+        ? latestDeviceMetrics.TotalConsumption.value / 1000
+        : 0;
+
+    return {
+      packet,
+      availableStations,
+      summary: {
+        monthlyProductionMwh: Number((dailyGridFeedInKwh / 1000).toFixed(3)),
+        lifetimeProductionMwh: latestLifetime,
+        dailyGridFeedInKwh: packet.latestTelemetry.dailyProductionKwh,
+        cumulativeGridFeedInMwh: packet.latestTelemetry.totalProductionMwh,
+        dailyConsumptionKwh,
+        cumulativeConsumptionMwh,
+      },
+    };
+  }
 
   /**
    * Purges legacy "packetName" field across all documents in MongoDB
