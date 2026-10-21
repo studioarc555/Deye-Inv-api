@@ -1,20 +1,11 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import path from "path";
-import { fileURLToPath } from "url";
 import { DeyeClient } from "./client/DeyeClient.js";
-import { ENDPOINT_REGISTRY } from "./testing/endpointRegistry.js";
-import { DeyeTestRunner } from "./testing/testRunner.js";
-import { ResidentialSyncService } from "./services/residentialSyncService.js";
-import { DashboardOverviewService } from "./services/dashboardOverviewService.js";
 import { ResidentialMongoService } from "./services/residentialMongoService.js";
 import { connectMongo, getMongoConfig } from "./db/mongoClient.js";
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -22,31 +13,7 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-/**
- * Root service status (Headless / Barebone API)
- */
-app.get("/", (req, res) => {
-  res.json({
-    service: "Deye Inverter Telemetry & Ingestion API",
-    status: "online",
-    version: "1.0.0",
-    architecture: "Barebone Headless Node.js (Raspberry Pi & Server Ready)",
-    database: "MongoDB Atlas (myDatabase.ResidentialAPI)",
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      health: "GET /api/health",
-      dbStatus: "GET /api/residential/db-status",
-      allStationPackets: "GET /api/residential/packets",
-      singleStationPacket: "GET /api/residential/packets/:stationId",
-      sync15MinPackets: "POST /api/residential/sync-packets",
-      syncSingleStation: "POST /api/residential/sync-packets/:stationId",
-      dashboardOverview: "GET /api/residential/dashboard/overview?plantId=:id&date=YYYY-MM-DD",
-      dashboardData: "GET /api/residential/dashboard/data?plantId=:id&date=YYYY-MM-DD",
-    },
-  });
-});
-
-// Global DeyeClient instance
+// Global DeyeClient & MongoService instance
 let client = new DeyeClient({
   baseUrl: process.env.DEYE_BASE_URL,
   appId: process.env.DEYE_APP_ID,
@@ -58,17 +25,41 @@ let client = new DeyeClient({
   token: process.env.DEYE_TOKEN,
 });
 
-let testRunner = new DeyeTestRunner(client);
-let syncService = new ResidentialSyncService(client);
-let overviewService = new DashboardOverviewService(client);
 let mongoService = new ResidentialMongoService(client);
 
 // =========================================================================
-// API Routes
+// Root & Documentation
 // =========================================================================
 
 /**
- * Health check & configuration status
+ * Root service status (Barebone Telemetry Ingestion API)
+ */
+app.get("/", (req, res) => {
+  res.json({
+    service: "Deye Cloud OpenAPI to MongoDB Telemetry Ingestion API",
+    status: "online",
+    version: "2.0.0",
+    architecture: "Barebone Headless Ingestion Engine (Raspberry Pi & Linux Server Ready)",
+    database: "MongoDB Atlas (myDatabase.ResidentialAPI)",
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      health: "GET /api/health",
+      liveStations: "GET /api/stations",
+      dbStatus: "GET /api/db-status",
+      syncAllStations: "POST /api/sync",
+      syncSingleStation: "POST /api/sync/:stationId",
+      savedPackets: "GET /api/packets?date=YYYY-MM-DD",
+      singleStationPacket: "GET /api/packets/:stationId?date=YYYY-MM-DD",
+    },
+  });
+});
+
+// =========================================================================
+// Health, Config & Discovery Routes
+// =========================================================================
+
+/**
+ * Health check & Deye configuration status
  */
 app.get("/api/health", (req, res) => {
   res.json({
@@ -80,6 +71,22 @@ app.get("/api/health", (req, res) => {
     hasToken: Boolean(client.token),
     email: client.email,
   });
+});
+
+/**
+ * Query live station list directly from Deye Cloud OpenAPI
+ */
+app.get("/api/stations", async (req, res) => {
+  try {
+    const listRes = await client.getStationList(1, 100);
+    res.json({
+      success: listRes.success,
+      totalStations: listRes.data?.total || listRes.data?.stationList?.length || 0,
+      stations: listRes.data?.stationList || [],
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 /**
@@ -95,8 +102,6 @@ app.get("/api/config", (req, res) => {
     companyId: client.companyId || "0",
     hasPassword: Boolean(client.password),
     tokenMasked: client.token ? "Bearer ******" + client.token.slice(-6) : "",
-    defaultStationId: process.env.DEFAULT_STATION_ID || "",
-    defaultDeviceSn: process.env.DEFAULT_DEVICE_SN || "",
   });
 });
 
@@ -115,10 +120,7 @@ app.post("/api/config", (req, res) => {
   if (companyId !== undefined) client.companyId = companyId;
   if (token !== undefined) client.setToken(token);
 
-  // Re-instantiate runner & services
-  testRunner = new DeyeTestRunner(client);
-  syncService = new ResidentialSyncService(client);
-  overviewService = new DashboardOverviewService(client);
+  // Re-instantiate mongo service
   mongoService = new ResidentialMongoService(client);
 
   res.json({
@@ -133,124 +135,11 @@ app.post("/api/config", (req, res) => {
   });
 });
 
-/**
- * List all available Deye OpenAPI endpoints
- */
-app.get("/api/endpoints", (req, res) => {
-  const categories: Record<string, any[]> = {};
-
-  ENDPOINT_REGISTRY.forEach((ep) => {
-    if (!categories[ep.category]) {
-      categories[ep.category] = [];
-    }
-    categories[ep.category].push({
-      id: ep.id,
-      method: ep.method,
-      path: ep.path,
-      summary: ep.summary,
-      description: ep.description,
-      isReadOnly: ep.isReadOnly,
-      requiresAuth: ep.requiresAuth,
-    });
-  });
-
-  res.json({
-    totalCount: ENDPOINT_REGISTRY.length,
-    categories,
-  });
-});
-
-/**
- * Test a single endpoint by ID
- */
-app.post("/api/test/single", async (req, res) => {
-  try {
-    const { endpointId, customPayload } = req.body;
-    if (!endpointId) {
-      return res.status(400).json({ error: "endpointId is required" });
-    }
-
-    const result = await testRunner.testEndpoint(endpointId, customPayload);
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Run test suite (read-only, category, or full)
- */
-app.post("/api/test/suite", async (req, res) => {
-  try {
-    const { readOnlyOnly = true, category, endpointIds } = req.body;
-    const summary = await testRunner.runSuite({
-      readOnlyOnly,
-      category,
-      endpointIds,
-    });
-    res.json(summary);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Calculate 15-minute call budget for DSEos Residential Dashboard
- */
-app.get("/api/residential/budget", (req, res) => {
-  const fleetSize = parseInt(req.query.fleetSize as string, 10) || 20;
-  const activeSelected = parseInt(req.query.activeUnits as string, 10) || 1;
-  const budget = syncService.calculateCallBudget(fleetSize, activeSelected);
-  res.json(budget);
-});
-
-/**
- * Execute live 15-minute residential sync against Deye API
- */
-app.post("/api/residential/sync", async (req, res) => {
-  try {
-    const { stationId, deviceSn } = req.body;
-    const result = await syncService.execute15MinSync(stationId, deviceSn);
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Consolidated Residential Dashboard Overview Endpoint
- * Query Params:
- *  - plantId: string / number (e.g. "13474" or "NFC")
- *  - date: string (ISO/Date "YYYY-MM-DD")
- *  - period: "M" | "Y" | "T" (Month, Year, Lifetime)
- */
-app.get("/api/residential/dashboard/overview", async (req, res) => {
-  try {
-    const plantId = (req.query.plantId as string) || process.env.DEFAULT_STATION_ID || "13474";
-    const date = (req.query.date as string) || new Date().toISOString().slice(0, 10);
-    const period = ((req.query.period as string)?.toUpperCase() as "M" | "Y" | "T") || "M";
-
-    const overview = await overviewService.getOverview({
-      plantId,
-      date,
-      period,
-    });
-
-    res.json(overview);
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: err.message || "Failed to fetch dashboard overview",
-    });
-
-  }
-});
-
 // =========================================================================
-// MongoDB Integration Routes (Database: myDatabase, Collection: ResidentialAPI)
+// MongoDB Integration & Telemetry Sync Routes
 // =========================================================================
 
-app.get("/api/residential/dashboard/data", async (req, res) => {
+app.get(["/api/dashboard/data", "/api/residential/dashboard/data"], async (req, res) => {
   try {
     const plantId = req.query.plantId as string | undefined;
     const date = req.query.date as string | undefined;
@@ -280,11 +169,10 @@ app.get("/api/residential/dashboard/data", async (req, res) => {
     });
   }
 });
-
 /**
  * Check MongoDB Connection Status & Collection Stats
  */
-app.get("/api/residential/db-status", async (req, res) => {
+app.get(["/api/db-status", "/api/residential/db-status"], async (req, res) => {
   try {
     const config = getMongoConfig();
     const db = await connectMongo();
@@ -300,9 +188,11 @@ app.get("/api/residential/db-status", async (req, res) => {
       totalDocuments: count,
       savedStationsCount: packets.length,
       stationsSummary: packets.map((p: any) => ({
+        plantId: p.plantId,
         stationId: p.stationId,
         stationName: p.stationName,
         deviceSn: p.deviceSn,
+        date: p.date,
         pointsCount: p.dtm?.length || 0,
         realTimeActivePower: p.latestTelemetry?.realTimeActivePower,
         realTimeActivePowerUnit: p.latestTelemetry?.realTimeActivePowerUnit || "kW",
@@ -322,97 +212,117 @@ app.get("/api/residential/db-status", async (req, res) => {
   }
 });
 
+
 /**
- * Execute 15-Minute Sync Cycle for all stations (or a single dynamic station):
- * Pulls all 5-minute data points for each station and performs an atomic upsert:
- *   - Packet 1: First Station (Station ID, Device SN, DTM, Production, Active Power, etc.)
- *   - Packet 2: Second Station (Station ID, Device SN, DTM, Production, Active Power, etc.)
- * 
+ * Ingest telemetry from Deye Cloud and atomically save/upsert to MongoDB:
+ * - If stationId is provided: syncs that specific station.
+ * - If stationId is omitted: dynamically discovers all stations and syncs all of them.
+ *
  * Endpoints:
+ *   POST /api/sync
+ *   POST /api/sync/:stationId
  *   POST /api/residential/sync-packets
  *   POST /api/residential/sync-packets/:stationId
  */
-app.post(["/api/residential/sync-packets/:stationId?", "/api/residential/sync-15min/:stationId?"], async (req, res) => {
-  try {
-    const targetStationId = (req.params as any).stationId || (req.query.stationId as string);
-    const date = (req.query.date as string) || req.body.date || new Date().toISOString().slice(0, 10);
-    const includeRaw = req.query.includeRaw === "true" || req.body.includeRaw === true;
-    const plantId = (req.query.plantId as string) || req.body.plantId;
+app.post(
+  [
+    "/api/sync/:stationId?",
+    "/api/residential/sync-packets/:stationId?",
+    "/api/residential/sync-15min/:stationId?",
+  ],
+  async (req, res) => {
+    try {
+      const targetStationId = (req.params as any).stationId || (req.query.stationId as string);
+      const date = (req.query.date as string) || req.body.date || new Date().toISOString().slice(0, 10);
+      const includeRaw = req.query.includeRaw === "true" || req.body.includeRaw === true;
+      const plantId = (req.query.plantId as string) || req.body.plantId;
 
-    if (targetStationId) {
-      // Sync single dynamic station
-      const singleRes = await mongoService.pullAndSaveStationPacket(String(targetStationId), 1, { date, includeRaw, plantId });
-      return res.json({
-        message: `Successfully executed 5-minute telemetry sync and atomic upsert for station ${targetStationId}`,
-        database: "myDatabase",
-        collection: "ResidentialAPI",
-        ...singleRes,
-      });
-    }
-
-    // Sync all stations (Packet 1 = First Station, Packet 2 = Second Station...)
-    const fullRes = await mongoService.execute15MinPacketSync({ date, includeRaw });
-    res.json({
-      message: `Completed 15-minute synchronization cycle for all stations into MongoDB (myDatabase.ResidentialAPI)`,
-      database: "myDatabase",
-      collection: "ResidentialAPI",
-      ...fullRes,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: err.message || "Failed to execute 15-minute packet sync",
-    });
-  }
-});
-
-/**
- * Retrieve saved station packets directly from MongoDB (ResidentialAPI)
- * Examples:
- *   GET /api/residential/packets           (Returns all station packets: Packet 1, Packet 2...)
- *   GET /api/residential/packets/:stationId (Returns packet for specific station)
- */
-app.get("/api/residential/packets/:stationId?", async (req, res) => {
-  try {
-    const stationId = (req.params as any).stationId;
-    const date = req.query.date as string;
-
-    if (stationId) {
-      const packet = await mongoService.getSavedPacket(stationId, date);
-      if (!packet) {
-        return res.status(404).json({
-          success: false,
-          message: `No saved packet found in MongoDB (myDatabase.ResidentialAPI) for station ID: ${stationId}`,
+      if (targetStationId) {
+        // Sync single dynamic station
+        const singleRes = await mongoService.pullAndSaveStationPacket(String(targetStationId), 1, {
+          date,
+          includeRaw,
+          plantId,
+        });
+        return res.json({
+          message: `Successfully executed telemetry sync and atomic upsert for station ${targetStationId}`,
+          database: "myDatabase",
+          collection: "ResidentialAPI",
+          ...singleRes,
         });
       }
-      return res.json({
+
+      // Sync all stations under the account
+      const fullRes = await mongoService.execute15MinPacketSync({ date, includeRaw });
+      res.json({
+        message: `Completed synchronization cycle for all stations into MongoDB (myDatabase.ResidentialAPI)`,
+        database: "myDatabase",
+        collection: "ResidentialAPI",
+        ...fullRes,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: err.message || "Failed to execute telemetry packet sync",
+      });
+    }
+  }
+);
+
+/**
+ * Retrieve saved station packets directly from MongoDB (myDatabase.ResidentialAPI)
+ * Examples:
+ *   GET /api/packets                      (All station packets)
+ *   GET /api/packets/:stationId           (Packet for specific station)
+ *   GET /api/packets?date=YYYY-MM-DD      (Filtered by date)
+ */
+app.get(
+  ["/api/packets/:stationId?", "/api/residential/packets/:stationId?"],
+  async (req, res) => {
+    try {
+      const stationId = (req.params as any).stationId;
+      const date = req.query.date as string;
+
+      if (stationId) {
+        const packet = await mongoService.getSavedPacket(stationId, date);
+        if (!packet) {
+          return res.status(404).json({
+            success: false,
+            message: `No saved packet found in MongoDB (myDatabase.ResidentialAPI) for station ID: ${stationId}`,
+          });
+        }
+        return res.json({
+          success: true,
+          database: "myDatabase",
+          collection: "ResidentialAPI",
+          packet,
+        });
+      }
+
+      const packets = await mongoService.getAllSavedPackets(date);
+      res.json({
         success: true,
         database: "myDatabase",
         collection: "ResidentialAPI",
-        packet,
+        totalPackets: packets.length,
+        packets,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: err.message,
       });
     }
-
-    const packets = await mongoService.getAllSavedPackets(date);
-    res.json({
-      success: true,
-      database: "myDatabase",
-      collection: "ResidentialAPI",
-      totalPackets: packets.length,
-      packets,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: err.message,
-    });
   }
-});
+);
 
-// Start Express Server
+// =========================================================================
+// Start Express Server & Automated Background Ingestion Engine
+// =========================================================================
+
 const server = app.listen(PORT, async () => {
   console.log(`\n=============================================================`);
-  console.log(`🚀 Deye Cloud OpenAPI Testing & Residential Telemetry Service`);
+  console.log(`🚀 Deye Cloud OpenAPI Telemetry Ingestion Service`);
   console.log(`📡 Server running on http://localhost:${PORT}`);
   console.log(`🌐 Base Deye Server: ${client.baseUrl}`);
   console.log(`🔑 App ID: ${client.appId}`);
@@ -424,13 +334,15 @@ const server = app.listen(PORT, async () => {
   if (process.env.AUTO_SYNC_ENABLED !== "false") {
     console.log(`⏱️ [Scheduler] 15-minute automated sync is ENABLED.`);
 
-    // Run first sync and legacy cleanup 5 seconds after startup
+    // Run first sync 5 seconds after startup
     setTimeout(async () => {
-      console.log(`⏱️ [Scheduler] Running initial 15-minute Deye packet sync...`);
+      console.log(`⏱️ [Scheduler] Running initial Deye packet sync for all stations...`);
       try {
         await mongoService.purgeLegacyPacketNameField();
         const initSync = await mongoService.execute15MinPacketSync();
-        console.log(`✅ [Scheduler] Initial sync complete: ${initSync.syncedPackets}/${initSync.totalStations} station packets saved to MongoDB.`);
+        console.log(
+          `✅ [Scheduler] Initial sync complete: ${initSync.syncedPackets}/${initSync.totalStations} station packets saved to MongoDB.`
+        );
       } catch (e: any) {
         console.warn(`⚠️ [Scheduler] Initial sync notice:`, e.message);
       }
@@ -441,10 +353,14 @@ const server = app.listen(PORT, async () => {
       console.log(`\n⏱️ [Scheduler] Executing 15-minute Deye packet sync cycle...`);
       try {
         const syncCycle = await mongoService.execute15MinPacketSync();
-        console.log(`✅ [Scheduler] Sync cycle complete: ${syncCycle.syncedPackets}/${syncCycle.totalStations} station packets updated in ${syncCycle.durationMs}ms.`);
+        console.log(
+          `✅ [Scheduler] Sync cycle complete: ${syncCycle.syncedPackets}/${syncCycle.totalStations} station packets updated in ${syncCycle.durationMs}ms.`
+        );
       } catch (err: any) {
         console.error(`❌ [Scheduler] 15-minute sync error:`, err.message);
       }
     }, FIFTEEN_MINUTES_MS);
   }
 });
+
+export { app, server };

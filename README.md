@@ -73,7 +73,35 @@ Each station's intraday telemetry is atomically saved into MongoDB Atlas collect
       "unitGridPower": "kW",
       "unitConsumptionPower": "kW"
     }
-  ]
+  ],
+
+  "electrical": {
+    "dcStrings": [
+      { "pv": 1, "voltage": 218.0, "voltageUnit": "V", "current": 0.0, "currentUnit": "A", "powerWatts": 0.0 },
+      { "pv": 2, "voltage": 223.1, "voltageUnit": "V", "current": 0.0, "currentUnit": "A", "powerWatts": 0.0 }
+    ],
+    "acGrid": {
+      "voltageR": 237.1,
+      "voltageS": 249.1,
+      "voltageT": 246.1,
+      "currentR": 0.7,
+      "currentS": 0.9,
+      "currentT": 0.4,
+      "frequencyHz": 50.06,
+      "totalActivePowerWatts": 34.0,
+      "lineVoltageAB": 410.6,
+      "lineVoltageBC": 431.4
+    },
+    "temperatures": {
+      "inverterTemp": 0.0,
+      "radiatorTemp": 0.0
+    },
+    "parametersCount": 77,
+    "parameters": {
+      "DCVoltagePV1": { "value": "218.00", "unit": "V", "name": "DCVoltagePV1" },
+      "ACVoltageRUA": { "value": "237.10", "unit": "V", "name": "ACVoltageRUA" }
+    }
+  }
 }
 ```
 
@@ -85,12 +113,12 @@ Each station's intraday telemetry is atomically saved into MongoDB Atlas collect
 | :--- | :--- | :--- |
 | `GET` | `/` | Root API service status and endpoint index |
 | `GET` | `/api/health` | Deye OpenAPI client connection health & token status |
-| `GET` | `/api/residential/db-status` | MongoDB Atlas connection health & document statistics |
-| `GET` | `/api/residential/packets` | Retrieve all station documents from MongoDB (optional `?date=YYYY-MM-DD`) |
-| `GET` | `/api/residential/packets/:stationId` | Retrieve saved telemetry document for a specific station (`?date=YYYY-MM-DD`) |
-| `POST` | `/api/residential/sync-packets` | Trigger on-demand sync cycle for all stations into MongoDB |
-| `POST` | `/api/residential/sync-packets/:stationId` | Trigger on-demand sync for a specific station (body or query `?date=YYYY-MM-DD`) |
-| `GET` | `/api/residential/dashboard/overview` | Consolidated 7-card telemetry overview (`?plantId=:id&date=YYYY-MM-DD&period=M`) |
+| `GET` | `/api/stations` | Query all live stations directly from Deye Cloud OpenAPI |
+| `GET` | `/api/db-status` | MongoDB Atlas connection health & document statistics |
+| `POST` | `/api/sync` | Ingest data from Deye Cloud and atomically save/upsert all stations into MongoDB |
+| `POST` | `/api/sync/:stationId` | Ingest and atomically save/upsert a specific station into MongoDB (`?date=YYYY-MM-DD`) |
+| `GET` | `/api/packets` | Retrieve all station documents from MongoDB (optional `?date=YYYY-MM-DD`) |
+| `GET` | `/api/packets/:stationId` | Retrieve saved telemetry document for a specific station (`?date=YYYY-MM-DD`) |
 
 ---
 
@@ -184,10 +212,6 @@ DEYE_PASSWORD=your_password
 DEYE_COMPANY_ID=0
 DEYE_TOKEN=your_bearer_token
 
-# Fallbacks (Optional)
-DEFAULT_STATION_ID=13474
-DEFAULT_DEVICE_SN=2506051213
-
 # Automated 15-Minute Sync Background Daemon
 AUTO_SYNC_ENABLED=true
 
@@ -199,15 +223,11 @@ MONGODB_COLLECTION=ResidentialAPI
 
 ---
 
-## 🧪 Testing
+## ⚡ Manual CLI Sync Execution
 
-Run testing tools included in the repository:
+Trigger an instant on-demand sync cycle from the terminal:
 
 ```bash
-# Test complete day's telemetry ingestion and print verified units
-npm run test:day
-
-# Run simulation test
 npm run sync
 ```
 
