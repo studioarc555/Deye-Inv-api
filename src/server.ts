@@ -281,18 +281,6 @@ app.get("/api/residential/dashboard/data", async (req, res) => {
   }
 });
 
-app.get("/api/residential/plants", async (_req, res) => {
-  try {
-    res.json({
-      success: true,
-      source: "mongodb",
-      plants: await mongoService.getResidentialPlants(),
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message || "Failed to fetch residential plants" });
-  }
-});
-
 /**
  * Check MongoDB Connection Status & Collection Stats
  */

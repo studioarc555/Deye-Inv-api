@@ -632,49 +632,6 @@ export class ResidentialMongoService {
       .toArray()) as unknown as StationPacket[];
   }
 
-  public async getResidentialPlants(): Promise<Array<{
-    plantId: string;
-    stationId: number;
-    stationName: string;
-    deviceSn: string;
-    installedCapacityKw: number;
-    status: StationPacket["latestTelemetry"]["status"];
-  }>> {
-    const collection = await getResidentialCollection();
-    const packets = await collection.find(
-    {
-      plantId: { $exists: true, $type: "string", $ne: "" },
-      stationId: { $exists: true, $type: "number" },
-    },
-      {
-        projection: {
-          _id: 0,
-          plantId: 1,
-          stationId: 1,
-          stationName: 1,
-          deviceSn: 1,
-          "latestTelemetry.installedCapacityKw": 1,
-          "latestTelemetry.status": 1,
-          updatedAt: 1,
-        },
-      }
-    ).sort({ updatedAt: -1 }).toArray() as unknown as Array<StationPacket & { updatedAt?: Date }>;
-
-    return Array.from(new Map(
-      packets.map((packet) => [
-        packet.plantId as string,
-        {
-          plantId: packet.plantId as string,
-          stationId: packet.stationId,
-          stationName: packet.stationName,
-          deviceSn: packet.deviceSn,
-          installedCapacityKw: packet.latestTelemetry.installedCapacityKw,
-          status: packet.latestTelemetry.status,
-        },
-      ])
-    ).values());
-  }
-
   /**
    * Reads the dashboard snapshot and aggregates persisted daily packets.
    * This intentionally never calls Deye Cloud; ingestion is handled by the
@@ -686,43 +643,46 @@ export class ResidentialMongoService {
     stationName?: string
   ): Promise<ResidentialDashboardData | null> {
     const collection = await getResidentialCollection();
-    const parsedStationId = stationIdParam ? parseInt(String(stationIdParam), 10) : undefined;
-    const stationId =
-      parsedStationId && !Number.isNaN(parsedStationId) ? parsedStationId : undefined;
+    const isNumeric = stationIdParam !== undefined && /^\d+$/.test(String(stationIdParam).trim());
+    const stationId = isNumeric ? parseInt(String(stationIdParam).trim(), 10) : undefined;
+    const plantIdStr = !isNumeric && stationIdParam ? String(stationIdParam).trim() : undefined;
+
+    const queryFilters: any[] = [];
+    if (stationId) queryFilters.push({ stationId });
+    if (plantIdStr) queryFilters.push({ plantId: plantIdStr });
+    if (stationName) {
+      queryFilters.push({
+        stationName: {
+          $regex: `^${stationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+          $options: "i",
+        },
+      });
+    }
+
+    const baseFilter: any = {};
+    if (date) baseFilter.date = date;
+    if (queryFilters.length > 0) {
+      baseFilter.$or = queryFilters;
+    }
 
     let packet = (await collection.findOne(
-      {
-        ...(stationId ? { stationId } : {}),
-        ...(stationName
-          ? {
-              stationName: {
-                $regex: `^${stationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-                $options: "i",
-              },
-            }
-          : {}),
-        ...(date ? { date } : {}),
-      },
+      baseFilter,
       {
         sort: { updatedAt: -1 },
         projection: { _id: 0 },
       }
     )) as StationPacket | null;
 
-    if (!packet && stationName) {
+    // If date-specific packet not found, try finding the latest available packet for this specific station/plant
+    if (!packet && queryFilters.length > 0) {
       packet = (await collection.findOne(
-        {
-          stationName: { $regex: `^${stationName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
-          ...(date ? { date } : {}),
-        },
+        { $or: queryFilters },
         { sort: { updatedAt: -1 }, projection: { _id: 0 } }
       )) as StationPacket | null;
     }
 
-    // Compatibility mode: until CMS plants are mapped to Deye stations, use
-    // the newest persisted packet for the requested date when the selector
-    // has no match. Never substitute a different date.
-    if (!packet) {
+    // Fallback only if no specific station/plant filter was requested
+    if (!packet && queryFilters.length === 0) {
       packet = (await collection.findOne(
         date ? { date } : {},
         { sort: { updatedAt: -1 }, projection: { _id: 0 } }
